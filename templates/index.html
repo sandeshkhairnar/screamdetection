@@ -137,7 +137,7 @@
             font-weight: bold;
         }
         
-        /* New styles for file upload and audio visualization */
+        /* Upload section styles */
         .upload-section {
             margin-top: 30px;
             padding: 20px;
@@ -532,7 +532,8 @@
             uploadForm.addEventListener('submit', function(e) {
                 e.preventDefault();
                 
-                const formData = new FormData(this);
+                const formData = new FormData();
+                formData.append('audio-file', audioFileInput.files[0]);
                 
                 if (!audioFileInput.files || !audioFileInput.files[0]) {
                     alert('Please select an audio file first');

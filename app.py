@@ -1,162 +1,228 @@
-from flask import Flask, render_template, request, jsonify, send_from_directory
-import numpy as np
-import sounddevice as sd
-import librosa
-import threading
-import time
+from flask import Flask, render_template, request, jsonify
 import os
-import tempfile
+import librosa
+import numpy as np
+from tensorflow.keras.models import load_model
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend for rendering
+import matplotlib.pyplot as plt
 from werkzeug.utils import secure_filename
-from detector import ScreamDetector
+import time
+import threading
+import queue
+import pyaudio
+import wave
 
 app = Flask(__name__)
-detector = ScreamDetector()
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['STATIC_FOLDER'] = 'static'
 
-# Configure upload settings
-UPLOAD_FOLDER = tempfile.gettempdir()
-ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'm4a'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+# Create necessary directories
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs('static', exist_ok=True)
 
-# Global variables
-is_recording = False
-recording_thread = None
-sample_rate = 22050  # Standard sample rate for audio analysis
-voice_intensity = []  # Store voice intensity for visualization
+# Global variables for audio recording
+FORMAT = pyaudio.paFloat32
+CHANNELS = 1
+RATE = 22050
+CHUNK = 1024
+recording = False
+audio_queue = queue.Queue()
+scream_detected = False
+confidence_level = 0.0
+audio_data = []
+voice_intensity = []
 
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+# Load the model once when the app starts
+model = load_model('models/audio_classification.keras')
+
+def extract_features(audio_data, sr=RATE):
+    """Extract MFCC features from audio data"""
+    try:
+        mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=40)
+        mfccs_mean = np.mean(mfccs.T, axis=0)
+        features = mfccs_mean.reshape(1, 40, 1, 1).astype('float32')
+        return features
+    except Exception as e:
+        print(f"Error extracting features: {e}")
+        return None
+
+def extract_features_from_file(file_path):
+    """Extract features from an audio file"""
+    try:
+        audio, sr = librosa.load(file_path, sr=None)
+        mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=40)
+        mfccs_mean = np.mean(mfccs.T, axis=0)
+        features = mfccs_mean.reshape(1, 40, 1, 1).astype('float32')
+        return features, audio, sr
+    except Exception as e:
+        print(f"Error extracting features from file: {e}")
+        return None, None, None
+
+def audio_recording_thread():
+    """Thread function for audio recording"""
+    global recording, audio_data, voice_intensity
+    p = pyaudio.PyAudio()
+    
+    stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK)
+    
+    while recording:
+        try:
+            data = np.frombuffer(stream.read(CHUNK), dtype=np.float32)
+            audio_queue.put(data)
+            audio_data.extend(data)
+            
+            # Keep only last 2 seconds for analysis
+            if len(audio_data) > RATE * 2:
+                audio_data = audio_data[-RATE * 2:]
+            
+            # Update voice intensity for visualization
+            chunk_intensity = np.abs(data) 
+            voice_intensity = chunk_intensity[::20]  # Downsample for visualization
+            
+        except Exception as e:
+            print(f"Error recording audio: {e}")
+            break
+    
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+def prediction_thread():
+    """Thread function for continuous prediction"""
+    global recording, scream_detected, confidence_level, audio_data
+    
+    while recording:
+        if len(audio_data) >= RATE:  # Have at least 1 second of audio
+            try:
+                # Process the current audio buffer
+                features = extract_features(np.array(audio_data))
+                if features is not None:
+                    prediction = model.predict(features, verbose=0)
+                    confidence_level = float(prediction[0][1])  # Assuming class 1 is scream
+                    scream_detected = confidence_level > 0.5
+            except Exception as e:
+                print(f"Error in prediction: {e}")
+        
+        # Wait before next prediction
+        time.sleep(0.3)
 
 @app.route('/')
 def index():
+    """Render the main template"""
     return render_template('index.html')
-
-def record_audio():
-    global is_recording, voice_intensity
-    buffer_duration = 1.0  # 1 second buffer
-    
-    while is_recording:
-        # Record audio for buffer_duration seconds
-        audio_data = sd.rec(int(buffer_duration * sample_rate), 
-                            samplerate=sample_rate, 
-                            channels=1, 
-                            dtype='float32')
-        sd.wait()  # Wait until recording is done
-        
-        if is_recording:  # Check again to avoid processing after stop button
-            # Calculate voice intensity for visualization
-            # We'll use a downsampled version of the audio data
-            downsampled = audio_data[::512].flatten()
-            voice_intensity = downsampled.tolist()
-            
-            # Process the audio
-            result = detector.detect(audio_data.flatten())
-            print(f"Detection result: {result}")
-            # No need to send result to client as we'll use polling
 
 @app.route('/start_recording', methods=['POST'])
 def start_recording():
-    global is_recording, recording_thread, voice_intensity
+    """Start audio recording for live detection"""
+    global recording, audio_data, scream_detected, confidence_level, voice_intensity
     
-    if not is_recording:
-        is_recording = True
+    if not recording:
+        recording = True
+        audio_data = []
+        scream_detected = False
+        confidence_level = 0.0
         voice_intensity = []
-        recording_thread = threading.Thread(target=record_audio)
-        recording_thread.start()
+        
+        # Start recording and prediction threads
+        threading.Thread(target=audio_recording_thread).start()
+        threading.Thread(target=prediction_thread).start()
+        
         return jsonify({"status": "success", "message": "Recording started"})
-    
-    return jsonify({"status": "error", "message": "Already recording"})
+    else:
+        return jsonify({"status": "error", "message": "Already recording"})
 
 @app.route('/stop_recording', methods=['POST'])
 def stop_recording():
-    global is_recording
+    """Stop audio recording"""
+    global recording
     
-    if is_recording:
-        is_recording = False
+    if recording:
+        recording = False
         return jsonify({"status": "success", "message": "Recording stopped"})
-    
-    return jsonify({"status": "error", "message": "Not recording"})
+    else:
+        return jsonify({"status": "error", "message": "Not recording"})
 
-@app.route('/get_status', methods=['GET'])
+@app.route('/get_status')
 def get_status():
-    # This endpoint allows the frontend to poll for the detection status
-    global voice_intensity
-    latest_status = detector.get_latest_result()
+    """Get current detection status for live mode"""
+    global recording, scream_detected, confidence_level, voice_intensity
     
-    # Ensure all values are native Python types
-    response = {
-        "is_recording": bool(is_recording),
-        "scream_detected": bool(latest_status.get("scream_detected", False)),
-        "confidence": float(latest_status.get("confidence", 0.0)),
-        "voice_intensity": voice_intensity
-    }
-    
-    return jsonify(response)
+    return jsonify({
+        "is_recording": recording,
+        "scream_detected": scream_detected,
+        "confidence": confidence_level,
+        "voice_intensity": voice_intensity.tolist() if isinstance(voice_intensity, np.ndarray) else []
+    })
 
 @app.route('/analyze_file', methods=['POST'])
 def analyze_file():
-    # Check if the post request has the file part
+    """Analyze uploaded audio file for screams"""
     if 'audio-file' not in request.files:
-        return jsonify({"status": "error", "message": "No file part"}), 400
+        return jsonify({"status": "error", "message": "No file part"})
     
     file = request.files['audio-file']
-    
-    # If user does not select file, browser submits an empty file
     if file.filename == '':
-        return jsonify({"status": "error", "message": "No selected file"}), 400
+        return jsonify({"status": "error", "message": "No selected file"})
     
-    if file and allowed_file(file.filename):
-        # Save the file temporarily
+    try:
+        # Save the uploaded file
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
         
-        try:
-            # Load the audio file with librosa
-            audio, sr = librosa.load(filepath, sr=sample_rate, mono=True)
+        # Extract features and make prediction
+        features, audio, sr = extract_features_from_file(filepath)
+        
+        if features is not None:
+            prediction = model.predict(features, verbose=0)
+            confidence = float(prediction[0][1])  # Assuming class 1 is scream
+            scream_detected = confidence > 0.5
             
-            # Calculate voice intensity for visualization
-            # We'll downsample the audio to create visualization data
-            step = max(1, len(audio) // 1000)  # Ensure we don't have too many points
-            downsampled = audio[::step]
-            voice_intensity_data = downsampled.tolist()
+            # Generate waveform for visualization
+            waveform_filename = f"{os.path.splitext(filename)[0]}_waveform.png"
+            waveform_path = os.path.join('static', waveform_filename)
+            plt.figure(figsize=(10, 2))
+            plt.title("Audio Waveform")
+            plt.plot(audio)
+            plt.axis('off')  # Hide axes
+            plt.tight_layout()
+            plt.savefig(waveform_path)
+            plt.close()
             
-            # Detect scream in the audio file
-            # We'll process it in chunks to simulate real-time detection
-            chunk_size = sr  # 1 second chunks
-            max_confidence = 0.0
-            scream_detected = False
-            
-            for i in range(0, len(audio), chunk_size):
-                chunk = audio[i:i+chunk_size]
-                if len(chunk) < chunk_size:  # If last chunk is too small
-                    break
-                    
-                result = detector.detect(chunk)
-                if result["confidence"] > max_confidence:
-                    max_confidence = result["confidence"]
-                
-                if result["scream_detected"]:
-                    scream_detected = True
-            
-            # Clean up the temporary file
-            os.remove(filepath)
+            # Prepare voice intensity data for visualization
+            # Downsample for reasonable visualization data size
+            intensity_data = np.abs(audio)
+            step = max(1, len(intensity_data) // 1000)
+            downsampled_intensity = intensity_data[::step]
             
             return jsonify({
                 "status": "success",
-                "scream_detected": bool(scream_detected),
-                "confidence": float(max_confidence),
-                "voice_intensity": voice_intensity_data
+                "scream_detected": scream_detected,
+                "confidence": confidence,
+                "waveform_image": f"/static/{waveform_filename}",
+                "voice_intensity": downsampled_intensity.tolist()
             })
+        else:
+            return jsonify({"status": "error", "message": "Error processing audio file"})
             
-        except Exception as e:
-            # Clean up in case of error
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            return jsonify({"status": "error", "message": str(e)}), 500
-    
-    return jsonify({"status": "error", "message": "Invalid file type"}), 400
+    except Exception as e:
+        print(f"Error analyzing file: {e}")
+        return jsonify({"status": "error", "message": f"Analysis error: {str(e)}"})
 
-if __name__ == '__main__':
-    app.run(debug=True)
+@app.route('/templates/<path:path>')
+def send_template(path):
+    """Serve template files"""
+    return render_template(path)
+
+@app.route('/static/<path:path>')
+def send_static(path):
+    """Serve static files"""
+    return send_from_directory('static', path)
+
+if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5000)
