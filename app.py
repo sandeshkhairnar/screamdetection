@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_file
 import os
 import librosa
 import numpy as np
@@ -6,7 +6,8 @@ from tensorflow.keras.models import load_model
 import matplotlib
 matplotlib.use('Agg')  # Use non-GUI backend for rendering
 import matplotlib.pyplot as plt
-from werkzeug.utils import secure_filename
+from io import BytesIO
+import base64
 import time
 import threading
 import queue
@@ -14,11 +15,9 @@ import pyaudio
 import wave
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['STATIC_FOLDER'] = 'static'
 
-# Create necessary directories
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+# Create necessary directory for static files
 os.makedirs('static', exist_ok=True)
 
 # Global variables for audio recording
@@ -47,17 +46,16 @@ def extract_features(audio_data, sr=RATE):
         print(f"Error extracting features: {e}")
         return None
 
-def extract_features_from_file(file_path):
-    """Extract features from an audio file"""
+def extract_features_from_audio(audio, sr):
+    """Extract features from audio data"""
     try:
-        audio, sr = librosa.load(file_path, sr=None)
         mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=40)
         mfccs_mean = np.mean(mfccs.T, axis=0)
         features = mfccs_mean.reshape(1, 40, 1, 1).astype('float32')
-        return features, audio, sr
+        return features
     except Exception as e:
-        print(f"Error extracting features from file: {e}")
-        return None, None, None
+        print(f"Error extracting features from audio: {e}")
+        return None
 
 def audio_recording_thread():
     """Thread function for audio recording"""
@@ -161,7 +159,7 @@ def get_status():
 
 @app.route('/analyze_file', methods=['POST'])
 def analyze_file():
-    """Analyze uploaded audio file for screams"""
+    """Analyze uploaded audio file for screams without saving any files"""
     if 'audio-file' not in request.files:
         return jsonify({"status": "error", "message": "No file part"})
     
@@ -170,45 +168,55 @@ def analyze_file():
         return jsonify({"status": "error", "message": "No selected file"})
     
     try:
-        # Save the uploaded file
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+        # Read file content directly into memory
+        file_content = file.read()
         
-        # Extract features and make prediction
-        features, audio, sr = extract_features_from_file(filepath)
+        # Use BytesIO to create a file-like object in memory
+        audio_bytes = BytesIO(file_content)
         
-        if features is not None:
-            prediction = model.predict(features, verbose=0)
-            confidence = float(prediction[0][1])  # Assuming class 1 is scream
-            scream_detected = confidence > 0.5
+        # Extract features directly from the BytesIO object
+        try:
+            audio, sr = librosa.load(audio_bytes, sr=None)
+            features = extract_features_from_audio(audio, sr)
             
-            # Generate waveform for visualization
-            waveform_filename = f"{os.path.splitext(filename)[0]}_waveform.png"
-            waveform_path = os.path.join('static', waveform_filename)
-            plt.figure(figsize=(10, 2))
-            plt.title("Audio Waveform")
-            plt.plot(audio)
-            plt.axis('off')  # Hide axes
-            plt.tight_layout()
-            plt.savefig(waveform_path)
-            plt.close()
-            
-            # Prepare voice intensity data for visualization
-            # Downsample for reasonable visualization data size
-            intensity_data = np.abs(audio)
-            step = max(1, len(intensity_data) // 1000)
-            downsampled_intensity = intensity_data[::step]
-            
-            return jsonify({
-                "status": "success",
-                "scream_detected": scream_detected,
-                "confidence": confidence,
-                "waveform_image": f"/static/{waveform_filename}",
-                "voice_intensity": downsampled_intensity.tolist()
-            })
-        else:
-            return jsonify({"status": "error", "message": "Error processing audio file"})
+            if features is not None:
+                prediction = model.predict(features, verbose=0)
+                confidence = float(prediction[0][1])  # Assuming class 1 is scream
+                scream_detected = confidence > 0.5
+                
+                # Generate waveform image in memory
+                img_bytes = BytesIO()
+                plt.figure(figsize=(10, 2))
+                plt.title("Audio Waveform")
+                plt.plot(audio)
+                plt.axis('off')  # Hide axes
+                plt.tight_layout()
+                plt.savefig(img_bytes, format='png')
+                plt.close()
+                
+                # Convert to base64 for embedding in response
+                img_bytes.seek(0)
+                img_base64 = base64.b64encode(img_bytes.read()).decode('utf-8')
+                waveform_data_url = f"data:image/png;base64,{img_base64}"
+                
+                # Prepare voice intensity data for visualization
+                intensity_data = np.abs(audio)
+                step = max(1, len(intensity_data) // 1000)
+                downsampled_intensity = intensity_data[::step]
+                
+                return jsonify({
+                    "status": "success",
+                    "scream_detected": scream_detected,
+                    "confidence": confidence,
+                    "waveform_image": waveform_data_url,
+                    "voice_intensity": downsampled_intensity.tolist()
+                })
+            else:
+                return jsonify({"status": "error", "message": "Error processing audio features"})
+                
+        except Exception as e:
+            print(f"Error processing audio: {e}")
+            return jsonify({"status": "error", "message": f"Error processing audio: {str(e)}"})
             
     except Exception as e:
         print(f"Error analyzing file: {e}")
