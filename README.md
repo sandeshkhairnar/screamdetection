@@ -1,13 +1,35 @@
-🔹Install Python 3.10
+## Requirements
 
-During installation, make sure to:
- - Check "Add Python to PATH"
- - Customize and install for all users (optional but helpful)
+- Python 3.10 
 
-After installation, verify:
- $python --version
-If it still shows other than 3.10, try using py -3.10
+---
 
-🔹Create a new virtual environment
-  $ py -3.10 -m venv venv
-  $ .\venv\Scripts\activate
+## ⚙️ Setup Instructions
+
+### 1️⃣ Clone the Repository
+
+```bash
+git clone https://github.com/sandeshkhairnar/screamdetection.git
+cd screamdetection
+```
+
+### 2️⃣ Create Virtual Environment
+
+```bash
+py -3.10 -m venv venv
+source venv/bin/activate        # On macOS/Linux
+venv\Scripts\activate           # On Windows
+```
+
+3️⃣ Install Dependencies
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+4️⃣ Run the App
+
+```bash
+python app.py
+```
